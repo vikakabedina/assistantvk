@@ -188,14 +188,6 @@ function renderStudent(me){
   const priceLine = me.price != null ? `${me.price}₽ / урок` : "цена ещё не задана";
   const balance = me.balance ?? 0;
 
-  // Сумма "к оплате" (если Виктория прислала напоминание) показывается прямо
-  // в карточке баланса, рядом с ценой — а не в блоке с картой.
-  let dueLine = "";
-  if (me.pending_lessons){
-    const amount = me.pending_lessons * (me.price || 0);
-    dueLine = `<div class="balance-label" style="margin-top:6px; font-weight:700;">К оплате: ${me.pending_lessons} ${wordLessons(me.pending_lessons)} — ${amount}₽</div>`;
-  }
-
   // Карта с номером и копированием: видна при активном напоминании,
   // а также когда напоминания нет, но баланс здоровый (>0) — можно оплатить
   // заранее. Если баланс 0/в минусе без напоминания — карта не показывается.
@@ -217,7 +209,6 @@ function renderStudent(me){
       <div class="balance-label">Баланс уроков</div>
       <div class="balance-num">${me.price != null ? balance : "—"} ${me.price != null ? wordLessons(balance) : ""}</div>
       <div class="balance-label">${priceLine}</div>
-      ${dueLine}
     </div>
 
     ${paymentBlock}
