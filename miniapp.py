@@ -5,7 +5,7 @@
 которое читает и меняет те же файлы, что и бот (/data/students.json,
 settings.json). Одна база данных — источник правды для чата и приложения.
 
-Подключение в bot.py — три строки в конце функции on_startup() (уже есть):
+Подключение в bot.py — в конце on_startup() (уже есть):
 
     import sys
     from miniapp import start_miniapp
@@ -31,7 +31,8 @@ HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "miniapp.ht
 
 # ---------- проверка, что запрос действительно пришёл из Telegram ----------
 def check_init_data(init_data: str, bot_token: str):
-    """Проверяет подпись initData от Telegram WebApp (см. core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app).
+    """Проверяет подпись initData от Telegram WebApp
+    (core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app).
     Возвращает dict с данными пользователя или None, если подпись неверна."""
     if not init_data or not bot_token:
         return None
@@ -67,6 +68,22 @@ def _forbidden():
 def _unauthorized():
     return web.json_response({"error": "unauthorized"}, status=401)
 
+def _bad(error, status=400):
+    return web.json_response({"error": error}, status=status)
+
+async def _json(request):
+    try:
+        data = await request.json()
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+async def _notify(uid, text, **kwargs):
+    try:
+        await core.bot.send_message(int(uid), text, reply_markup=core.student_menu(), **kwargs)
+    except Exception as e:
+        logging.error(f"miniapp notify student error: {e}")
+
 
 # ---------- страницы и API ----------
 async def handle_index(request):
@@ -85,19 +102,25 @@ async def handle_me(request):
     if not s:
         return web.json_response({"is_admin": False, "registered": False})
 
+    enrollments = []
+    for key in core.sorted_enroll_keys(s):
+        e = core.get_enrollments(s)[key]
+        enrollments.append({
+            "key": key,
+            "label": core.enroll_label(key),
+            "price": e.get("price"),
+            "balance": e.get("balance"),
+            "pending_lessons": e.get("pending_lessons"),
+            "awaiting_confirmation": e.get("awaiting_confirmation", False),
+        })
+
     return web.json_response({
         "is_admin": False,
         "registered": True,
         "name": s["name"],
-        "mode": s.get("mode"),
-        "group": s.get("group"),
-        "group_label": core.GROUPS.get(s.get("group"), s.get("group")),
-        "price": s.get("price"),
-        "balance": s.get("balance"),
         "active": s.get("active", True),
         "paused": s.get("paused", False),
-        "awaiting_confirmation": s.get("awaiting_confirmation", False),
-        "pending_lessons": s.get("pending_lessons"),
+        "enrollments": enrollments,
         "card_number": core.get_card_number(),
     })
 
@@ -107,14 +130,27 @@ async def handle_students(request):
     if not user or not core.is_admin(user["id"]):
         return _forbidden()
     db = core.load_db()
-    out = [{"id": uid, **s} for uid, s in db.items()]
-    return web.json_response({"students": out, "groups": core.GROUPS})
+    students = []
+    for uid, s in db.items():
+        students.append({
+            "id": uid,
+            "name": s.get("name", ""),
+            "active": s.get("active", True),
+            "paused": s.get("paused", False),
+            "enrollments": core.get_enrollments(s),
+        })
+    keys = core.all_enroll_keys()
+    return web.json_response({
+        "students": students,
+        "keys": keys,
+        "labels": {k: core.enroll_label(k) for k in keys},
+    })
 
 
 async def handle_paid(request):
     """Ученик жмёт «Я оплатил(а)» из приложения.
-    Если активного напоминания нет — приложение само спросило ученика
-    «сколько уроков ты оплатил(а)» и прислало это число в теле запроса."""
+    body: {key?, lessons?} — key нужен, если у ученика больше одной подписки;
+    lessons нужен, если по этой подписке нет активного напоминания."""
     user = _auth(request)
     if not user:
         return _unauthorized()
@@ -122,45 +158,45 @@ async def handle_paid(request):
     db = core.load_db()
     s = db.get(uid)
     if not s:
-        return web.json_response({"error": "not_registered"}, status=404)
+        return _bad("not_registered", 404)
 
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    reported_lessons = body.get("lessons")
+    body = await _json(request)
+    enr = core.get_enrollments(s)
+    key = body.get("key")
+    if not key:
+        if len(enr) == 1:
+            key = next(iter(enr))
+        else:
+            return _bad("key_required")
+    e = enr.get(key)
+    if e is None:
+        return _bad("unknown_enrollment", 404)
 
-    if s.get("pending_lessons"):
-        lessons = s["pending_lessons"]
+    if e.get("pending_lessons"):
+        lessons = e["pending_lessons"]
         had_reminder = True
-    elif reported_lessons:
-        try:
-            lessons = int(reported_lessons)
-        except (TypeError, ValueError):
-            return web.json_response({"error": "invalid_lessons"}, status=400)
-        if lessons <= 0:
-            return web.json_response({"error": "invalid_lessons"}, status=400)
-        s["pending_lessons"] = lessons
-        had_reminder = False
     else:
-        # Приложение должно было спросить количество уроков до вызова этого API —
-        # если пришли без него, просим повторить с указанием числа.
-        return web.json_response({"error": "lessons_required"}, status=400)
+        try:
+            lessons = int(body.get("lessons"))
+        except (TypeError, ValueError):
+            return _bad("lessons_required")
+        if lessons <= 0:
+            return _bad("invalid_lessons")
+        e["pending_lessons"] = lessons
+        had_reminder = False
 
-    price = s.get("price") or 0
-    amount = lessons * price
-    s["awaiting_confirmation"] = True
+    amount = lessons * (e.get("price") or 0)
+    e["awaiting_confirmation"] = True
     core.save_db(db)
 
     suffix = "" if had_reminder else " — без предварительного напоминания"
-    text = (f"🥰 {s['name']} говорит, что оплатил(а) {lessons} "
+    text = (f"🥰 {s['name']} говорит, что оплатил(а){core.enroll_for(s, key)} {lessons} "
             f"{core.lessons_word(lessons)} ({amount}₽){suffix} — в приложении.\n\n"
             f"Подтверди в приложении или в чате боту.")
-
     try:
         await core.bot.send_message(core.ADMIN_ID, text)
-    except Exception as e:
-        logging.error(f"miniapp notify admin error: {e}")
+    except Exception as ex:
+        logging.error(f"miniapp notify admin error: {ex}")
 
     return web.json_response({"ok": True})
 
@@ -169,75 +205,69 @@ async def handle_confirm(request):
     user = _auth(request)
     if not user or not core.is_admin(user["id"]):
         return _forbidden()
-    body = await request.json()
-    uid = body.get("uid")
-    amount = body.get("amount")  # нужно только для оплаты без предварительного напоминания
+    body = await _json(request)
+    uid, key = body.get("uid"), body.get("key")
 
     db = core.load_db()
     s = db.get(uid)
-    if not s:
-        return web.json_response({"error": "not_found"}, status=404)
+    e = core.get_enrollments(s or {}).get(key)
+    if not s or e is None:
+        return _bad("not_found", 404)
+    if not e.get("pending_lessons"):
+        return _bad("nothing_to_confirm")
 
-    if s.get("pending_lessons"):
-        lessons = s["pending_lessons"]
-    elif amount is not None and s.get("price"):
-        lessons = int(amount) // s["price"]
-    else:
-        return web.json_response({"error": "amount_required"}, status=400)
-
-    s["balance"] = (s.get("balance") or 0) + lessons
-    s["pending_lessons"] = None
-    s["reminded_at"] = None
-    s["followup_sent"] = False
-    s["awaiting_confirmation"] = False
+    lessons = e["pending_lessons"]
+    e["balance"] = (e.get("balance") or 0) + lessons
+    core.reset_enrollment_reminder(e)
     core.save_db(db)
 
-    try:
-        await core.bot.send_message(int(uid), "Спасибо за оплату!", reply_markup=core.student_menu())
-    except Exception as e:
-        logging.error(f"miniapp notify student error: {e}")
-
-    return web.json_response({"ok": True, "balance": s["balance"], "lessons": lessons})
+    await _notify(uid, "Спасибо за оплату!")
+    return web.json_response({"ok": True, "balance": e["balance"], "lessons": lessons})
 
 
 async def handle_setup(request):
+    """Создаёт подписку (если её ещё нет) или меняет цену/баланс существующей.
+    Так же работает «добавить ученика в занятия»."""
     user = _auth(request)
     if not user or not core.is_admin(user["id"]):
         return _forbidden()
-    body = await request.json()
-    uid = body.get("uid")
-    price = body.get("price")
-    balance = body.get("balance")
+    body = await _json(request)
+    uid, key = body.get("uid"), body.get("key")
+    if not core.valid_enroll_key(key):
+        return _bad("unknown_enrollment")
 
     db = core.load_db()
     s = db.get(uid)
     if not s:
-        return web.json_response({"error": "not_found"}, status=404)
-
-    if price is not None:
-        s["price"] = int(price)
-    if balance is not None:
-        s["balance"] = int(balance)
-    core.save_db(db)
+        return _bad("not_found", 404)
 
     try:
-        await core.bot.send_message(
-            int(uid),
-            f"Твой абонемент настроен Викторией:\nЦена урока: {s['price']}₽\n"
-            f"Баланс: {s['balance']} {core.lessons_word(s['balance'])}",
-            reply_markup=core.student_menu()
-        )
-    except Exception as e:
-        logging.error(f"miniapp notify student error: {e}")
+        price = None if body.get("price") is None else int(body["price"])
+        balance = None if body.get("balance") is None else int(body["balance"])
+    except (TypeError, ValueError):
+        return _bad("invalid_number")
 
-    return web.json_response({"ok": True, "student": s})
+    e = s.setdefault("enrollments", {}).setdefault(key, core.new_enrollment())
+    if price is not None:
+        e["price"] = price
+    if balance is not None:
+        e["balance"] = balance
+    core.save_db(db)
+
+    if core.is_configured(e):
+        await _notify(
+            uid,
+            f"Твой абонемент настроен Викторией — {core.enroll_label(key)}:\n"
+            f"Цена урока: {e['price']}₽\nБаланс: {e['balance']} {core.lessons_word(e['balance'])}"
+        )
+    return web.json_response({"ok": True})
 
 
 async def handle_lesson(request):
     user = _auth(request)
     if not user or not core.is_admin(user["id"]):
         return _forbidden()
-    body = await request.json()
+    body = await _json(request)
     kind = body.get("kind")  # "individual" | "group"
 
     db = core.load_db()
@@ -246,36 +276,38 @@ async def handle_lesson(request):
     if kind == "individual":
         uid = body.get("uid")
         s = db.get(uid)
-        if not s:
-            return web.json_response({"error": "not_found"}, status=404)
-        s["balance"] = (s.get("balance") or 0) - 1
-        notified.append((uid, s))
-    else:
+        e = core.get_enrollments(s or {}).get(core.INDIVIDUAL)
+        if not s or e is None:
+            return _bad("not_found", 404)
+        e["balance"] = (e.get("balance") or 0) - 1
+        notified.append((uid, s, core.INDIVIDUAL, e))
+    elif kind == "group":
         group_key = body.get("group")
+        if group_key not in core.GROUPS:
+            return _bad("unknown_group")
         for uid, s in db.items():
-            if s.get("active") and not s.get("paused") and s.get("group") == group_key:
-                s["balance"] = (s.get("balance") or 0) - 1
-                notified.append((uid, s))
+            e = core.get_enrollments(s).get(group_key)
+            if e is not None and s.get("active") and not s.get("paused"):
+                e["balance"] = (e.get("balance") or 0) - 1
+                notified.append((uid, s, group_key, e))
+    else:
+        return _bad("unknown_kind")
 
     core.save_db(db)
-    for uid, s in notified:
-        try:
-            await core.bot.send_message(
-                int(uid), f"Занятие отмечено. Баланс: {s['balance']} {core.lessons_word(s['balance'])}",
-                reply_markup=core.student_menu()
-            )
-        except Exception as e:
-            logging.error(f"miniapp notify student error: {e}")
-
-    return web.json_response({"ok": True, "updated": [{"id": uid, "balance": s["balance"]} for uid, s in notified]})
+    for uid, s, key, e in notified:
+        await _notify(
+            uid,
+            f"Занятие отмечено{core.enroll_tag(s, key)}. Баланс: {e['balance']} {core.lessons_word(e['balance'])}"
+        )
+    return web.json_response({"ok": True, "updated": [{"id": uid, "balance": e["balance"]} for uid, s, key, e in notified]})
 
 
 async def handle_remind(request):
     user = _auth(request)
     if not user or not core.is_admin(user["id"]):
         return _forbidden()
-    body = await request.json()
-    uid = body.get("uid")
+    body = await _json(request)
+    uid, key = body.get("uid"), body.get("key")
     try:
         lessons = int(body.get("lessons", 0))
     except (TypeError, ValueError):
@@ -283,43 +315,33 @@ async def handle_remind(request):
 
     db = core.load_db()
     s = db.get(uid)
-    if not s or not s.get("price") or lessons <= 0:
-        return web.json_response({"error": "invalid"}, status=400)
+    e = core.get_enrollments(s or {}).get(key)
+    if not s or e is None or e.get("price") is None or lessons <= 0:
+        return _bad("invalid")
 
-    price = s["price"]
-    amount = lessons * price
-    s["pending_lessons"] = lessons
-    s["reminded_at"] = str(core.date.today())
-    s["followup_sent"] = False
+    amount = lessons * e["price"]
+    e["pending_lessons"] = lessons
+    e["reminded_at"] = str(core.date.today())
+    e["followup_sent"] = False
+    e["awaiting_confirmation"] = False
     core.save_db(db)
 
-    card = core.get_card_number()
-    try:
-        await core.bot.send_message(
-            int(uid),
-            f"{s['name']}, добрый день! Напоминаем об оплате: {lessons} {core.lessons_word(lessons)} — {amount}₽.\n\n"
-            f"Оплатить можно на карту: {card}\n\nПосле оплаты нажми кнопку в приложении или в чате🤓",
-            reply_markup=core.student_menu()
-        )
-    except Exception as e:
-        logging.error(f"miniapp remind send error: {e}")
-
+    await _notify(uid, core.build_reminder_text(s, key, lessons), parse_mode="HTML")
     return web.json_response({"ok": True, "amount": amount})
 
 
 async def handle_manage(request):
-    """action: toggle_pause | remove | reactivate"""
+    """action: toggle_pause | remove | reactivate (на уровне ученика целиком)"""
     user = _auth(request)
     if not user or not core.is_admin(user["id"]):
         return _forbidden()
-    body = await request.json()
-    uid = body.get("uid")
-    action = body.get("action")
+    body = await _json(request)
+    uid, action = body.get("uid"), body.get("action")
 
     db = core.load_db()
     s = db.get(uid)
     if not s:
-        return web.json_response({"error": "not_found"}, status=404)
+        return _bad("not_found", 404)
 
     if action == "toggle_pause":
         s["paused"] = not s.get("paused", False)
@@ -328,21 +350,16 @@ async def handle_manage(request):
     elif action == "reactivate":
         s["active"] = True
         s["paused"] = False
-        s["reminded_at"] = None
-        s["pending_lessons"] = None
-        s["followup_sent"] = False
-        s["awaiting_confirmation"] = False
+        for e in core.get_enrollments(s).values():
+            core.reset_enrollment_reminder(e)
     else:
-        return web.json_response({"error": "unknown_action"}, status=400)
+        return _bad("unknown_action")
 
     core.save_db(db)
-    return web.json_response({"ok": True, "student": s})
+    return web.json_response({"ok": True})
 
 
-async def start_miniapp(core_module):
-    global core
-    core = core_module
-
+def build_app():
     app = web.Application()
     app.router.add_get("/", handle_index)
     app.router.add_get("/api/me", handle_me)
@@ -353,8 +370,14 @@ async def start_miniapp(core_module):
     app.router.add_post("/api/lesson", handle_lesson)
     app.router.add_post("/api/remind", handle_remind)
     app.router.add_post("/api/manage", handle_manage)
+    return app
 
-    runner = web.AppRunner(app)
+
+async def start_miniapp(core_module):
+    global core
+    core = core_module
+
+    runner = web.AppRunner(build_app())
     await runner.setup()
     port = int(os.getenv("PORT", "8080"))
     site = web.TCPSite(runner, "0.0.0.0", port)
