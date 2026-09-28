@@ -102,6 +102,10 @@ input[type=text], input[type=number]{
   background:var(--text); color:var(--bg); padding:10px 18px; border-radius:99px;
   font-size:13px; z-index:100; opacity:0; transition:opacity .25s;}
 .toast.show{opacity:1;}
+
+.card-title{font-weight:700; font-size:14px; margin-bottom:6px;}
+.badges{display:flex; flex-direction:column; gap:4px; align-items:flex-end;}
+.enroll-editor{margin-top:12px;}
 </style>
 </head>
 <body>
@@ -125,6 +129,11 @@ function toast(msg){
   setTimeout(()=>toastEl.classList.remove("show"), 2200);
 }
 
+// Всё, что пришло от пользователей (имена), экранируем перед вставкой в HTML
+function esc(s){
+  return String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
 async function api(path, opts={}){
   const headers = Object.assign({"X-Telegram-Init-Data": initData}, opts.headers||{});
   if (opts.body) headers["Content-Type"] = "application/json";
@@ -134,6 +143,7 @@ async function api(path, opts={}){
   if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
   return data;
 }
+const post = (path, body) => api(path, {method:"POST", body: JSON.stringify(body)});
 
 function wordLessons(n){
   const a = Math.abs(n);
@@ -143,24 +153,29 @@ function wordLessons(n){
   if (d >= 2 && d <= 4) return "урока";
   return "уроков";
 }
-
 function balanceClass(balance){
   if (balance > 1) return "ok";
   if (balance === 0 || balance === 1) return "warn";
   return "bad";
 }
-function badgeClass(balance){
-  if (balance > 1) return "ok";
-  if (balance === 0 || balance === 1) return "warn";
-  return "bad";
+const badgeClass = balanceClass;
+
+function openSheet(html){
+  const overlay = document.createElement("div");
+  overlay.className = "overlay";
+  overlay.innerHTML = `<div class="sheet"><div class="sheet-close"></div>${html}</div>`;
+  document.body.appendChild(overlay);
+  overlay.addEventListener("click", (e)=>{ if (e.target === overlay) overlay.remove(); });
+  return overlay;
 }
 
-// ================= СТУДЕНТ =================
+// ---------- реквизиты с копированием ----------
 function cardBlock(cardNumber){
   return `
+    <div class="card-title">Реквизиты для оплаты</div>
     <div class="copy-row">
-      <span class="card-number">${cardNumber}</span>
-      <button class="copy-btn" data-copy="${cardNumber}">📋 Скопировать</button>
+      <span class="card-number">${esc(cardNumber)}</span>
+      <button class="copy-btn" data-copy="${esc(cardNumber)}">📋 Скопировать</button>
     </div>`;
 }
 
@@ -183,89 +198,101 @@ function attachCopyHandlers(root){
   });
 }
 
+// ================= УЧЕНИК =================
+function enrollCard(e){
+  if (e.price == null || e.balance == null){
+    return `<div class="card"><div class="student-name">${esc(e.label)}</div>
+      <div class="hint">Виктория ещё настраивает этот абонемент</div></div>`;
+  }
+  return `
+    <div class="balance-card ${balanceClass(e.balance)}">
+      <div class="balance-label" style="font-weight:700;">${esc(e.label)}</div>
+      <div class="balance-label" style="margin-top:6px;">Баланс уроков</div>
+      <div class="balance-num">${e.balance} ${wordLessons(e.balance)}</div>
+      <div class="balance-label">${e.price}₽ / урок</div>
+    </div>`;
+}
+
 function renderStudent(me){
-  const bcls = balanceClass(me.balance ?? 0);
-  const priceLine = me.price != null ? `${me.price}₽ / урок` : "цена ещё не задана";
-  const balance = me.balance ?? 0;
+  const ready = me.enrollments.filter(e => e.price != null);
 
-  // Карта с номером и копированием: видна при активном напоминании,
-  // а также когда напоминания нет, но баланс здоровый (>0) — можно оплатить
-  // заранее. Если баланс 0/в минусе без напоминания — карта не показывается.
-  let paymentBlock = "";
-  if (me.pending_lessons || (balance > 0 && me.card_number)){
-    paymentBlock = `<div class="card">${cardBlock(me.card_number)}</div>`;
-  }
+  // Реквизиты: при активном напоминании, а также когда по какой-то подписке
+  // баланс положительный (можно оплатить заранее). Если везде 0 или минус
+  // и напоминаний нет — блок не показываем.
+  const showCard = me.card_number && ready.some(e => e.pending_lessons || (e.balance ?? 0) > 0);
+  const paymentBlock = showCard ? `<div class="card">${cardBlock(me.card_number)}</div>` : "";
 
-  let confirmBadge = "";
-  if (me.awaiting_confirmation){
-    confirmBadge = `<div class="hint" style="margin-top:6px;">⏳ Ждём подтверждения Виктории</div>`;
-  }
+  let banner = "";
+  if (!me.active) banner = `<div class="card">Твой аккаунт неактивен. Напиши Виктории.</div>`;
+  else if (me.paused) banner = `<div class="card">Занятия сейчас на паузе.</div>`;
+
+  const awaiting = me.enrollments.some(e => e.awaiting_confirmation);
+  const confirmBadge = awaiting ? `<div class="hint" style="margin-top:6px;">⏳ Ждём подтверждения Виктории</div>` : "";
 
   app.innerHTML = `
-    <h1>Привет, ${me.name}! 👋</h1>
-    <div class="hint">${me.group_label || "Индивидуальные занятия"}</div>
-
-    <div class="balance-card ${bcls}">
-      <div class="balance-label">Баланс уроков</div>
-      <div class="balance-num">${me.price != null ? balance : "—"} ${me.price != null ? wordLessons(balance) : ""}</div>
-      <div class="balance-label">${priceLine}</div>
-    </div>
-
+    <h1>Привет, ${esc(me.name)}! 👋</h1>
+    ${banner}
+    ${me.enrollments.map(enrollCard).join("")}
     ${paymentBlock}
     ${confirmBadge}
-
-    <button id="btnPaid" ${!me.price ? "disabled" : ""}>Я оплатил(а)</button>
+    <button id="btnPaid" ${ready.length ? "" : "disabled"}>Я оплатил(а)</button>
   `;
   attachCopyHandlers(app);
 
-  document.getElementById("btnPaid")?.addEventListener("click", async ()=>{
-    if (me.pending_lessons){
-      try{
-        await api("/api/paid", {method:"POST", body: JSON.stringify({})});
-        toast("Спасибо! Отправили Виктории на подтверждение 🙌");
-        load();
-      }catch(e){ toast("Не получилось: " + e.message); }
-    } else {
-      openReportLessonsSheet();
-    }
+  document.getElementById("btnPaid")?.addEventListener("click", ()=>{
+    if (ready.length === 1) paidFor(ready[0], ready.length);
+    else openChooseEnrollmentSheet(ready);
   });
 }
 
-function openReportLessonsSheet(){
-  const overlay = document.createElement("div");
-  overlay.className = "overlay";
-  overlay.innerHTML = `
-    <div class="sheet">
-      <div class="sheet-close"></div>
-      <h2 style="margin-top:0">Сколько уроков ты оплатил(а)?</h2>
-      <div class="card">
-        <input type="number" id="lessonsPaidInput" placeholder="например 2" min="1">
-        <button id="btnSubmitLessons" style="margin-top:8px;">Отправить</button>
-      </div>
-      <button class="secondary" id="btnCancelReport" style="margin-top:10px;">Отмена</button>
-    </div>
-  `;
-  document.body.appendChild(overlay);
-  overlay.addEventListener("click", (e)=>{ if (e.target === overlay) overlay.remove(); });
-  overlay.querySelector("#btnCancelReport").addEventListener("click", ()=>overlay.remove());
+function openChooseEnrollmentSheet(ready){
+  const overlay = openSheet(`
+    <h2 style="margin-top:0">За какие занятия оплата?</h2>
+    ${ready.map(e => `<button class="secondary choose-btn" data-key="${esc(e.key)}" style="margin-bottom:8px;">${esc(e.label)}</button>`).join("")}
+    <button class="secondary" id="btnCancelChoose" style="margin-top:6px;">Отмена</button>
+  `);
+  overlay.querySelector("#btnCancelChoose").addEventListener("click", ()=>overlay.remove());
+  overlay.querySelectorAll(".choose-btn").forEach(btn=>{
+    btn.addEventListener("click", ()=>{
+      overlay.remove();
+      paidFor(ready.find(e => e.key === btn.dataset.key), ready.length);
+    });
+  });
+}
 
+async function paidFor(e, totalReady){
+  if (e.pending_lessons){
+    try{
+      await post("/api/paid", {key: e.key});
+      toast("Спасибо! Отправили Виктории на подтверждение 🙌");
+      load();
+    }catch(err){ toast("Не получилось: " + err.message); }
+  } else {
+    openReportLessonsSheet(e, totalReady);
+  }
+}
+
+function openReportLessonsSheet(e, totalReady){
+  const overlay = openSheet(`
+    <h2 style="margin-top:0">Сколько уроков ты оплатил(а)?</h2>
+    ${totalReady > 1 ? `<div class="hint">${esc(e.label)}</div>` : ""}
+    <div class="card" style="margin-top:10px;">
+      <input type="number" id="lessonsPaidInput" placeholder="например 2" min="1">
+      <button id="btnSubmitLessons" style="margin-top:8px;">Отправить</button>
+    </div>
+    <button class="secondary" id="btnCancelReport" style="margin-top:10px;">Отмена</button>
+  `);
+  overlay.querySelector("#btnCancelReport").addEventListener("click", ()=>overlay.remove());
   overlay.querySelector("#btnSubmitLessons").addEventListener("click", async ()=>{
     const n = parseInt(overlay.querySelector("#lessonsPaidInput").value, 10);
     if (!(n > 0)){ toast("Введи число больше нуля"); return; }
     try{
-      await api("/api/paid", {method:"POST", body: JSON.stringify({lessons:n})});
+      await post("/api/paid", {key: e.key, lessons: n});
       toast("Спасибо! Отправили Виктории на подтверждение 🙌");
       overlay.remove();
       load();
-    }catch(e){ toast("Не получилось: " + e.message); }
+    }catch(err){ toast("Не получилось: " + err.message); }
   });
-}
-
-function renderNotSetup(me){
-  app.innerHTML = `
-    <h1>Привет, ${me.name}! 👋</h1>
-    <div class="card">Виктория скоро настроит твой абонемент — загляни чуть позже 🤓</div>
-  `;
 }
 
 function renderNotRegistered(){
@@ -275,23 +302,32 @@ function renderNotRegistered(){
   `;
 }
 
-// ================= АДМИН (ВИКТОРИЯ) =================
-let adminData = { students: [], groups: {} };
+// ================= ПРЕПОДАВАТЕЛЬ =================
+let adminData = { students: [], keys: [], labels: {} };
 let activeTab = "students";
 
-function priceStr(s){ return s.price != null ? `${s.price}₽` : "—"; }
-function balStr(s){ return s.balance != null ? `${s.balance} ${wordLessons(s.balance)}` : "—"; }
-function modeLabel(s, groups){ return s.mode === "individual" ? "Индивидуально" : (groups[s.group] || s.group || "?"); }
+const shortLabel = (key) => key === "individual" ? "Инд." : (adminData.labels[key] || key);
+const priceStr = (e) => e.price != null ? `${e.price}₽` : "—";
+const balStr = (e) => e.balance != null ? `${e.balance} ${wordLessons(e.balance)}` : "—";
+
+function enrollList(s){
+  const enr = s.enrollments || {};
+  return adminData.keys.filter(k => enr[k]).map(k => ({key: k, ...enr[k]}));
+}
 
 async function loadAdminData(){
-  const data = await api("/api/students");
-  adminData = data;
+  adminData = await api("/api/students");
+}
+async function refreshAdmin(){
+  await loadAdminData();
+  renderAdmin();
 }
 
 function renderAdmin(){
-  const active = adminData.students.filter(s=>s.active);
-  const inactive = adminData.students.filter(s=>!s.active);
-  const awaiting = active.filter(s=>s.awaiting_confirmation);
+  const active = adminData.students.filter(s => s.active);
+  const inactive = adminData.students.filter(s => !s.active);
+  const awaitingCount = active.reduce((sum, s) =>
+    sum + enrollList(s).filter(e => e.awaiting_confirmation && e.pending_lessons).length, 0);
 
   app.innerHTML = `
     <h1>Преподаватель Виктория</h1>
@@ -299,7 +335,7 @@ function renderAdmin(){
       <div class="tab ${activeTab==='students'?'active':''}" data-tab="students">👥 Ученики</div>
       <div class="tab ${activeTab==='lesson'?'active':''}" data-tab="lesson">📚 Урок</div>
       <div class="tab ${activeTab==='remind'?'active':''}" data-tab="remind">🔔 Напомнить</div>
-      <div class="tab ${activeTab==='confirm'?'active':''}" data-tab="confirm">✅ Подтвердить${awaiting.length?` (${awaiting.length})`:''}</div>
+      <div class="tab ${activeTab==='confirm'?'active':''}" data-tab="confirm">✅ Подтвердить${awaitingCount?` (${awaitingCount})`:''}</div>
       <div class="tab ${activeTab==='removed'?'active':''}" data-tab="removed">🗄 Удалённые</div>
     </div>
     <div id="tabBody"></div>
@@ -312,21 +348,26 @@ function renderAdmin(){
   if (activeTab === "students") renderStudentsTab(body, active);
   else if (activeTab === "lesson") renderLessonTab(body, active);
   else if (activeTab === "remind") renderRemindTab(body, active);
-  else if (activeTab === "confirm") renderConfirmTab(body, awaiting);
+  else if (activeTab === "confirm") renderConfirmTab(body, active);
   else if (activeTab === "removed") renderRemovedTab(body, inactive);
 }
 
+// ---------- Ученики ----------
 function renderStudentsTab(body, active){
   if (!active.length){ body.innerHTML = `<div class="card">Учеников пока нет.</div>`; return; }
-  body.innerHTML = `<div class="card solid">` + active.map(s=>`
-    <div class="student-row" data-uid="${s.id}">
-      <div>
-        <div class="student-name">${s.name} ${s.paused?'⏸':''}</div>
-        <div class="student-sub">${modeLabel(s, adminData.groups)} · цена ${priceStr(s)}</div>
-      </div>
-      <div class="badge ${badgeClass(s.balance ?? 0)}">${balStr(s)}</div>
-    </div>
-  `).join("") + `</div>`;
+  body.innerHTML = `<div class="card solid">` + active.map(s => {
+    const list = enrollList(s);
+    return `
+      <div class="student-row" data-uid="${esc(s.id)}">
+        <div>
+          <div class="student-name">${esc(s.name)} ${s.paused ? "⏸" : ""}</div>
+          <div class="student-sub">${list.map(e => `${esc(shortLabel(e.key))} · ${priceStr(e)}`).join(" | ") || "нет занятий"}</div>
+        </div>
+        <div class="badges">
+          ${list.map(e => `<div class="badge ${badgeClass(e.balance ?? 0)}">${esc(shortLabel(e.key))}: ${e.balance != null ? e.balance : "—"}</div>`).join("")}
+        </div>
+      </div>`;
+  }).join("") + `</div>`;
 
   body.querySelectorAll(".student-row").forEach(row=>{
     row.addEventListener("click", ()=> openStudentSheet(row.dataset.uid));
@@ -334,75 +375,89 @@ function renderStudentsTab(body, active){
 }
 
 function openStudentSheet(uid){
-  const s = adminData.students.find(x=>x.id===uid);
+  const s = adminData.students.find(x => x.id === uid);
   if (!s) return;
-  const overlay = document.createElement("div");
-  overlay.className = "overlay";
-  overlay.innerHTML = `
-    <div class="sheet">
-      <div class="sheet-close"></div>
-      <h2 style="margin-top:0">${s.name}</h2>
-      <div class="hint">${modeLabel(s, adminData.groups)}</div>
+  const enr = s.enrollments || {};
 
-      <div class="card" style="margin-top:12px;">
+  const blocks = adminData.keys.map(key => {
+    const e = enr[key];
+    const label = esc(adminData.labels[key] || key);
+    if (e){
+      return `
+        <div class="card enroll-editor" data-key="${esc(key)}">
+          <div class="student-name">${label}</div>
+          <div class="hint">Цена урока (₽)</div>
+          <input type="number" class="f-price" value="${e.price ?? ""}" placeholder="например 3000">
+          <div class="hint">Баланс уроков (может быть отрицательным)</div>
+          <input type="number" class="f-balance" value="${e.balance ?? ""}" placeholder="например 0 или -1">
+          <button class="save-enroll" style="margin-top:8px;">💾 Сохранить</button>
+        </div>`;
+    }
+    return `
+      <div class="card enroll-editor" data-key="${esc(key)}" data-new="1">
+        <div class="student-name">➕ Добавить в занятия: ${label}</div>
         <div class="hint">Цена урока (₽)</div>
-        <input type="number" id="priceInput" value="${s.price ?? ''}" placeholder="например 3000">
-        <div class="hint">Баланс уроков (может быть отрицательным)</div>
-        <input type="number" id="balanceInput" value="${s.balance ?? ''}" placeholder="например 0 или -1">
-        <button id="btnSave" style="margin-top:8px;">💾 Сохранить</button>
-      </div>
+        <input type="number" class="f-price" placeholder="например 3000">
+        <div class="hint">Стартовый баланс уроков</div>
+        <input type="number" class="f-balance" placeholder="например 0">
+        <button class="save-enroll" style="margin-top:8px;">➕ Добавить</button>
+      </div>`;
+  }).join("");
 
-      <div class="row" style="margin-top:14px;">
-        <button class="secondary" id="btnPause">${s.paused ? "▶️ Снять с паузы" : "⏸ Поставить на паузу"}</button>
-      </div>
-      <div class="row" style="margin-top:8px;">
-        <button class="danger" id="btnRemove">🗑 Удалить ученика</button>
-      </div>
-      <div class="row" style="margin-top:14px;">
-        <button class="secondary" id="btnClose">Закрыть</button>
-      </div>
+  const overlay = openSheet(`
+    <h2 style="margin-top:0">${esc(s.name)}</h2>
+    ${blocks}
+    <div class="row" style="margin-top:6px;">
+      <button class="secondary" id="btnPause">${s.paused ? "▶️ Снять с паузы" : "⏸ Поставить на паузу"}</button>
     </div>
-  `;
-  document.body.appendChild(overlay);
-  overlay.addEventListener("click", (e)=>{ if (e.target === overlay) overlay.remove(); });
+    <div class="row" style="margin-top:8px;"><button class="danger" id="btnRemove">🗑 Удалить ученика</button></div>
+    <div class="row" style="margin-top:14px;"><button class="secondary" id="btnClose">Закрыть</button></div>
+  `);
   overlay.querySelector("#btnClose").addEventListener("click", ()=>overlay.remove());
 
-  overlay.querySelector("#btnSave").addEventListener("click", async ()=>{
-    const price = overlay.querySelector("#priceInput").value;
-    const balance = overlay.querySelector("#balanceInput").value;
-    try{
-      await api("/api/setup", {method:"POST", body: JSON.stringify({
-        uid, price: price!=="" ? parseInt(price,10) : null, balance: balance!=="" ? parseInt(balance,10) : null
-      })});
-      toast("Сохранено ✅");
-      overlay.remove();
-      await refreshAdmin();
-    }catch(e){ toast("Ошибка: " + e.message); }
+  overlay.querySelectorAll(".save-enroll").forEach(btn=>{
+    btn.addEventListener("click", async ()=>{
+      const box = btn.closest(".enroll-editor");
+      const key = box.dataset.key;
+      const isNew = box.dataset.new === "1";
+      const price = box.querySelector(".f-price").value;
+      const balance = box.querySelector(".f-balance").value;
+      if (isNew && (price === "" || balance === "")){ toast("Укажи цену урока и стартовый баланс"); return; }
+      try{
+        await post("/api/setup", {
+          uid, key,
+          price: price !== "" ? parseInt(price, 10) : null,
+          balance: balance !== "" ? parseInt(balance, 10) : null,
+        });
+        toast(isNew ? "Добавлено ✅" : "Сохранено ✅");
+        overlay.remove();
+        await refreshAdmin();
+      }catch(e){ toast("Ошибка: " + e.message); }
+    });
   });
 
   overlay.querySelector("#btnPause").addEventListener("click", async ()=>{
-    try{
-      await api("/api/manage", {method:"POST", body: JSON.stringify({uid, action:"toggle_pause"})});
-      overlay.remove();
-      await refreshAdmin();
-    }catch(e){ toast("Ошибка: " + e.message); }
+    try{ await post("/api/manage", {uid, action:"toggle_pause"}); overlay.remove(); await refreshAdmin(); }
+    catch(e){ toast("Ошибка: " + e.message); }
   });
-
   overlay.querySelector("#btnRemove").addEventListener("click", async ()=>{
     if (!confirm(`Удалить ${s.name}?`)) return;
-    try{
-      await api("/api/manage", {method:"POST", body: JSON.stringify({uid, action:"remove"})});
-      overlay.remove();
-      await refreshAdmin();
-    }catch(e){ toast("Ошибка: " + e.message); }
+    try{ await post("/api/manage", {uid, action:"remove"}); overlay.remove(); await refreshAdmin(); }
+    catch(e){ toast("Ошибка: " + e.message); }
   });
 }
 
+// ---------- Урок ----------
 function renderLessonTab(body, active){
-  const individuals = active.filter(s=>s.mode === "individual");
-  const groupButtons = Object.entries(adminData.groups).map(([key,label])=>`
-    <button class="group-btn" data-group="${key}" style="margin-bottom:8px;">👥 Группа ${label}</button>
-  `).join("");
+  const present = active.filter(s => !s.paused);
+  const groupKeys = adminData.keys.filter(k => k !== "individual");
+
+  const groupButtons = groupKeys.map(key => {
+    const n = present.filter(s => (s.enrollments || {})[key]).length;
+    return `<button class="group-btn" data-group="${esc(key)}" style="margin-bottom:8px;">👥 Группа ${esc(adminData.labels[key])} (${n})</button>`;
+  }).join("");
+
+  const individuals = present.filter(s => (s.enrollments || {}).individual);
 
   body.innerHTML = `
     <div class="card solid">
@@ -411,23 +466,23 @@ function renderLessonTab(body, active){
     </div>
     <h2>Индивидуальные ученики</h2>
     <div class="card solid">
-      ${individuals.length ? individuals.map(s=>`
-        <div class="student-row" data-uid="${s.id}">
+      ${individuals.length ? individuals.map(s => `
+        <div class="student-row" data-uid="${esc(s.id)}">
           <div>
-            <div class="student-name">${s.name}</div>
-            <div class="student-sub">баланс ${balStr(s)}</div>
+            <div class="student-name">${esc(s.name)}</div>
+            <div class="student-sub">баланс ${balStr(s.enrollments.individual)}</div>
           </div>
           <button class="small">−1 урок</button>
-        </div>
-      `).join("") : '<div class="hint">Нет индивидуальных учеников</div>'}
+        </div>`).join("") : '<div class="hint">Нет индивидуальных учеников</div>'}
     </div>
   `;
 
   body.querySelectorAll(".group-btn").forEach(btn=>{
     btn.addEventListener("click", async ()=>{
-      if (!confirm(`Списать урок у всей группы «${btn.textContent.trim()}»?`)) return;
+      const group = btn.dataset.group;
+      if (!confirm(`Списать урок у всей группы «${adminData.labels[group]}»?`)) return;
       try{
-        const res = await api("/api/lesson", {method:"POST", body: JSON.stringify({kind:"group", group: btn.dataset.group})});
+        const res = await post("/api/lesson", {kind:"group", group});
         toast(`Списано у ${res.updated.length} чел.`);
         await refreshAdmin();
       }catch(e){ toast("Ошибка: " + e.message); }
@@ -437,10 +492,10 @@ function renderLessonTab(body, active){
   body.querySelectorAll(".student-row").forEach(row=>{
     row.addEventListener("click", async ()=>{
       const uid = row.dataset.uid;
-      const s = adminData.students.find(x=>x.id===uid);
+      const s = adminData.students.find(x => x.id === uid);
       if (!confirm(`Отметить занятие у ${s.name}?`)) return;
       try{
-        await api("/api/lesson", {method:"POST", body: JSON.stringify({kind:"individual", uid})});
+        await post("/api/lesson", {kind:"individual", uid});
         toast("Занятие отмечено ✅");
         await refreshAdmin();
       }catch(e){ toast("Ошибка: " + e.message); }
@@ -448,140 +503,116 @@ function renderLessonTab(body, active){
   });
 }
 
+// ---------- Напомнить ----------
 function renderRemindTab(body, active){
-  const withPrice = active.filter(s=>s.price != null);
+  const entries = [];
+  active.filter(s => !s.paused).forEach(s => {
+    enrollList(s).forEach(e => { if (e.price != null) entries.push({s, e}); });
+  });
   body.innerHTML = `
     <div class="card solid">
-      ${withPrice.length ? withPrice.map(s=>`
-        <div class="student-row" data-uid="${s.id}">
+      ${entries.length ? entries.map(({s, e}) => `
+        <div class="student-row" data-uid="${esc(s.id)}" data-key="${esc(e.key)}">
           <div>
-            <div class="student-name">${s.name}</div>
-            <div class="student-sub">цена ${priceStr(s)} · баланс ${balStr(s)}</div>
+            <div class="student-name">${esc(s.name)}</div>
+            <div class="student-sub">${esc(shortLabel(e.key))} · цена ${priceStr(e)} · баланс ${balStr(e)}</div>
           </div>
           <div class="hint">→</div>
-        </div>
-      `).join("") : '<div class="hint">Нет учеников с заданной ценой</div>'}
+        </div>`).join("") : '<div class="hint">Нет учеников с заданной ценой</div>'}
     </div>
   `;
   body.querySelectorAll(".student-row").forEach(row=>{
-    row.addEventListener("click", ()=> openRemindSheet(row.dataset.uid));
+    row.addEventListener("click", ()=> openRemindSheet(row.dataset.uid, row.dataset.key));
   });
 }
 
-function openRemindSheet(uid){
-  const s = adminData.students.find(x=>x.id===uid);
-  if (!s) return;
-  const overlay = document.createElement("div");
-  overlay.className = "overlay";
-  overlay.innerHTML = `
-    <div class="sheet">
-      <div class="sheet-close"></div>
-      <h2 style="margin-top:0">${s.name}</h2>
-      <div class="hint">Цена урока: ${s.price}₽</div>
-      <div class="card" style="margin-top:12px;">
-        <div class="hint">Сколько уроков нужно оплатить?</div>
-        <input type="number" id="lessonsInput" placeholder="например 2" min="1">
-        <div id="amountPreview" class="hint" style="margin-top:6px;"></div>
-        <button id="btnSend" style="margin-top:10px;">Отправить напоминание</button>
-      </div>
-      <button class="secondary" id="btnClose" style="margin-top:10px;">Отмена</button>
+function openRemindSheet(uid, key){
+  const s = adminData.students.find(x => x.id === uid);
+  const e = s && (s.enrollments || {})[key];
+  if (!e) return;
+  const overlay = openSheet(`
+    <h2 style="margin-top:0">${esc(s.name)}</h2>
+    <div class="hint">${esc(adminData.labels[key])} · цена урока ${e.price}₽</div>
+    <div class="card" style="margin-top:12px;">
+      <div class="hint">Сколько уроков нужно оплатить?</div>
+      <input type="number" id="lessonsInput" placeholder="например 2" min="1">
+      <div id="amountPreview" class="hint" style="margin-top:6px;"></div>
+      <button id="btnSend" style="margin-top:10px;">Отправить напоминание</button>
     </div>
-  `;
-  document.body.appendChild(overlay);
-  overlay.addEventListener("click", (e)=>{ if (e.target === overlay) overlay.remove(); });
+    <button class="secondary" id="btnClose" style="margin-top:10px;">Отмена</button>
+  `);
   overlay.querySelector("#btnClose").addEventListener("click", ()=>overlay.remove());
 
   const input = overlay.querySelector("#lessonsInput");
   const preview = overlay.querySelector("#amountPreview");
   input.addEventListener("input", ()=>{
     const n = parseInt(input.value, 10);
-    preview.textContent = (n>0) ? `К оплате: ${n * s.price}₽` : "";
+    preview.textContent = (n > 0) ? `К оплате: ${n * e.price}₽` : "";
   });
 
   overlay.querySelector("#btnSend").addEventListener("click", async ()=>{
     const n = parseInt(input.value, 10);
-    if (!(n>0)){ toast("Введи число больше нуля"); return; }
+    if (!(n > 0)){ toast("Введи число больше нуля"); return; }
     try{
-      const res = await api("/api/remind", {method:"POST", body: JSON.stringify({uid, lessons:n})});
+      const res = await post("/api/remind", {uid, key, lessons: n});
       toast(`Отправлено: ${n} ${wordLessons(n)} — ${res.amount}₽`);
       overlay.remove();
       await refreshAdmin();
-    }catch(e){ toast("Ошибка: " + e.message); }
+    }catch(err){ toast("Ошибка: " + err.message); }
   });
 }
 
-function renderConfirmTab(body, awaiting){
-  if (!awaiting.length){ body.innerHTML = `<div class="card">Никто не ждёт подтверждения 🎉</div>`; return; }
-  body.innerHTML = awaiting.map(s=>{
-    if (s.pending_lessons){
-      const amount = s.pending_lessons * (s.price||0);
-      return `
-        <div class="card solid">
-          <div class="student-name">${s.name}</div>
-          <div class="hint">${s.pending_lessons} ${wordLessons(s.pending_lessons)} — ${amount}₽</div>
-          <button data-uid="${s.id}" class="confirm-known" style="margin-top:8px;">✅ Подтвердить</button>
-        </div>`;
-    }
+// ---------- Подтвердить ----------
+function renderConfirmTab(body, active){
+  const entries = [];
+  active.forEach(s => {
+    enrollList(s).forEach(e => { if (e.awaiting_confirmation && e.pending_lessons) entries.push({s, e}); });
+  });
+  if (!entries.length){ body.innerHTML = `<div class="card">Никто не ждёт подтверждения 🎉</div>`; return; }
+
+  body.innerHTML = entries.map(({s, e}) => {
+    const amount = e.pending_lessons * (e.price || 0);
     return `
       <div class="card solid">
-        <div class="student-name">${s.name}</div>
-        <div class="hint">Оплатил(а) без напоминания — введи сумму</div>
-        <input type="number" class="amount-input" placeholder="сумма в ₽" data-uid="${s.id}">
-        <button data-uid="${s.id}" class="confirm-amount" style="margin-top:6px;">Посчитать и подтвердить</button>
+        <div class="student-name">${esc(s.name)}</div>
+        <div class="hint">${esc(adminData.labels[e.key])}</div>
+        <div class="hint">${e.pending_lessons} ${wordLessons(e.pending_lessons)} — ${amount}₽</div>
+        <button class="confirm-btn" data-uid="${esc(s.id)}" data-key="${esc(e.key)}" style="margin-top:8px;">✅ Подтвердить</button>
       </div>`;
   }).join("");
 
-  body.querySelectorAll(".confirm-known").forEach(btn=>{
+  body.querySelectorAll(".confirm-btn").forEach(btn=>{
     btn.addEventListener("click", async ()=>{
       try{
-        const res = await api("/api/confirm", {method:"POST", body: JSON.stringify({uid: btn.dataset.uid})});
+        const res = await post("/api/confirm", {uid: btn.dataset.uid, key: btn.dataset.key});
         toast(`Оплата подтверждена, +${res.lessons} ${wordLessons(res.lessons)}`);
-        await refreshAdmin();
-      }catch(e){ toast("Ошибка: " + e.message); }
-    });
-  });
-  body.querySelectorAll(".confirm-amount").forEach(btn=>{
-    btn.addEventListener("click", async ()=>{
-      const uid = btn.dataset.uid;
-      const input = body.querySelector(`.amount-input[data-uid="${uid}"]`);
-      const amount = parseInt(input.value, 10);
-      if (!(amount>0)){ toast("Введи сумму"); return; }
-      try{
-        const res = await api("/api/confirm", {method:"POST", body: JSON.stringify({uid, amount})});
-        toast(`Оплата подтверждена, +${res.lessons} ${wordLessons(res.lessons)}`);
-        await refreshAdmin();
-      }catch(e){ toast("Ошибка: " + e.message); }
-    });
-  });
-}
-
-function renderRemovedTab(body, inactive){
-  if (!inactive.length){ body.innerHTML = `<div class="card">Удалённых учеников нет.</div>`; return; }
-  body.innerHTML = `<div class="card solid">` + inactive.map(s=>`
-    <div class="student-row" data-uid="${s.id}">
-      <div>
-        <div class="student-name">${s.name}</div>
-        <div class="student-sub">${modeLabel(s, adminData.groups)}</div>
-      </div>
-      <button class="small reactivate-btn" data-uid="${s.id}">♻️ Вернуть</button>
-    </div>
-  `).join("") + `</div>`;
-
-  body.querySelectorAll(".reactivate-btn").forEach(btn=>{
-    btn.addEventListener("click", async (e)=>{
-      e.stopPropagation();
-      try{
-        await api("/api/manage", {method:"POST", body: JSON.stringify({uid: btn.dataset.uid, action:"reactivate"})});
-        toast("Реактивирован(а) ✅");
         await refreshAdmin();
       }catch(err){ toast("Ошибка: " + err.message); }
     });
   });
 }
 
-async function refreshAdmin(){
-  await loadAdminData();
-  renderAdmin();
+// ---------- Удалённые ----------
+function renderRemovedTab(body, inactive){
+  if (!inactive.length){ body.innerHTML = `<div class="card">Удалённых учеников нет.</div>`; return; }
+  body.innerHTML = `<div class="card solid">` + inactive.map(s => `
+    <div class="student-row">
+      <div>
+        <div class="student-name">${esc(s.name)}</div>
+        <div class="student-sub">${enrollList(s).map(e => esc(shortLabel(e.key))).join(" + ")}</div>
+      </div>
+      <button class="small reactivate-btn" data-uid="${esc(s.id)}">♻️ Вернуть</button>
+    </div>`).join("") + `</div>`;
+
+  body.querySelectorAll(".reactivate-btn").forEach(btn=>{
+    btn.addEventListener("click", async ()=>{
+      try{
+        await post("/api/manage", {uid: btn.dataset.uid, action:"reactivate"});
+        toast("Реактивирован(а) ✅");
+        await refreshAdmin();
+      }catch(err){ toast("Ошибка: " + err.message); }
+    });
+  });
 }
 
 // ================= ЗАГРУЗКА =================
@@ -594,10 +625,9 @@ async function load(){
       return;
     }
     if (!me.registered){ renderNotRegistered(); return; }
-    if (me.price == null || me.balance == null){ renderNotSetup(me); return; }
     renderStudent(me);
   }catch(e){
-    app.innerHTML = `<div class="card">Не удалось загрузить данные: ${e.message}</div>`;
+    app.innerHTML = `<div class="card">Не удалось загрузить данные: ${esc(e.message)}</div>`;
   }
 }
 
